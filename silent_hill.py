@@ -107,7 +107,7 @@ highlight_keywords_list = []
 
 DWELL_TIME = 0.3
 BROADCAST_BATCH_SIZE = 4
-CHANNEL_LIST = [1]
+CHANNEL_LIST = [1, 6, 11]
 
 seen_clients = set()
 active_ssids = []
@@ -934,12 +934,20 @@ def set_channel(interface, channel):
     os.system(f"iwconfig {interface} channel {channel}")
 
 # Trame beacon
-def generate_beacon(ssid, mac):
-    dot11 = Dot11(type=0, subtype=8, addr1="ff:ff:ff:ff:ff:ff", addr2=mac, addr3=mac)
+def generate_beacon(ssid, mac, channel):
+    dot11 = Dot11(
+        type=0,
+        subtype=8,
+        addr1="ff:ff:ff:ff:ff:ff",
+        addr2=mac,
+        addr3=mac
+    )
+
     beacon = Dot11Beacon(cap='ESS')
     essid = Dot11Elt(ID='SSID', info=ssid)
     rates = Dot11Elt(ID='Rates', info=b'\x82\x84\x8b\x96')
-    frame = RadioTap()/dot11/beacon/essid/rates
+    dsset = Dot11Elt(ID='DSset', info=bytes([channel]))
+    frame = RadioTap()/dot11/beacon/essid/rates/dsset
     return frame
 
 # Display infos
@@ -966,28 +974,36 @@ def display_status():
 # Thread Beacon
 def beacon_loop(INTERFACE):
     global active_ssids, current_channel
+    round_counter = 0
+    channel_list = random.sample(CHANNEL_LIST, len(CHANNEL_LIST))
+    channel_index = 0
+    current_channel = channel_list[channel_index]
+    set_channel(INTERFACE, current_channel)
+
     while not stop_event.is_set():
-        for channel in random.sample(CHANNEL_LIST, len(CHANNEL_LIST)):
+        round_counter += 1
+        if round_counter % 15 == 0:
+            channel_index = (channel_index + 1) % len(channel_list)
+            current_channel = channel_list[channel_index]
+            set_channel(INTERFACE, current_channel)
+
+        for _ in range(3):
             if stop_event.is_set():
                 break
-            current_channel = channel
-            set_channel(INTERFACE, channel)
 
-            for _ in range(3):
+            batch = random.sample(ESSID_LIST, BROADCAST_BATCH_SIZE)
+            active_ssids = [ssid for ssid in batch if ssid]
+            start_time = time.time()
+            while time.time() - start_time < DWELL_TIME:
                 if stop_event.is_set():
                     break
-                batch = random.sample(ESSID_LIST, BROADCAST_BATCH_SIZE)
-                active_ssids = [ssid for ssid in batch if ssid]
 
-                start_time = time.time()
-                while time.time() - start_time < DWELL_TIME:
-                    if stop_event.is_set():
-                        break
-                    for ssid, mac in zip(active_ssids, FIXED_MACS):
-                        frame = generate_beacon(ssid, mac)
-                        sendp(frame, iface=INTERFACE, verbose=0)
-                    display_status()
-                    time.sleep(0.1)
+                for ssid, mac in zip(active_ssids, FIXED_MACS):
+                    frame = generate_beacon(ssid, mac, current_channel)
+                    sendp(frame, iface=INTERFACE, verbose=0)
+
+                display_status()
+                time.sleep(0.5)
 
 # Handler Sniff
 def karma_packet_handler(pkt):
