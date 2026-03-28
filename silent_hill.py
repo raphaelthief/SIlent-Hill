@@ -107,7 +107,7 @@ highlight_keywords_list = []
 
 DWELL_TIME = 0.3
 BROADCAST_BATCH_SIZE = 4
-CHANNEL_LIST = [1, 6, 11]
+CHANNEL_LIST = [1]
 
 seen_clients = set()
 active_ssids = []
