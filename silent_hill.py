@@ -850,6 +850,32 @@ def kill_connection():
         sys.exit(0)
 
 ########################## KAMRMA SCANNER ##########################
+# ----------------- Fingerprint -----------------
+def fingerprint_client(pkt):
+    if not pkt.haslayer(Dot11Elt):
+        return None
+
+    elt = pkt.getlayer(Dot11Elt)
+    features = []
+
+    while elt:
+        if elt.ID in [1, 50]:  # Supported Rates
+            features.append(("rates", elt.info))
+
+        elif elt.ID in [45, 191]:  # HT / VHT Capabilities
+            features.append((f"cap{elt.ID}", elt.info))
+
+        elif elt.ID == 221:  # Vendor Specific
+            features.append(("vendor", elt.info[:3]))
+
+        elt = elt.payload.getlayer(Dot11Elt)
+
+    if not features:
+        return None
+
+    raw = b"|".join([k.encode() + b":" + v for k, v in features])
+    return hashlib.sha256(raw).hexdigest()[:12]
+
 def set_monitor_mode(interface, karma_mode):
     print(f"[*] Enabling monitor mode on {interface}...")
 
@@ -955,19 +981,41 @@ def clear_terminal():
     os.system('clear')
 
 def display_status():
+    global client_profiles, seen_clients, probe_responses_seen, active_ssids, current_channel
+
     with display_lock:
         clear_terminal()
         print(f"[Channel {current_channel}] - " + ", ".join(active_ssids))
 
+        # ------------------ Detected Clients ------------------
         print("\n[!] Detected probes ESSID Clients:")
-        print(f"{'MAC Adress':<20} {'ESSID Probe':<30}")
-        print("-" * 50)
-        for mac, ssid in seen_clients:
-            print(f"{mac:<20} {ssid:<30}")
+        print(f"{'ID':<5} {'Signal(dBm)':<12} {'MAC Address':<20} {'SSID Probe':<30}")
+        print("-" * 70)
 
+        for (mac, ssid), signal in seen_clients.items():
+            client_id = None
+            for i, (fp, data) in enumerate(client_profiles.items()):
+                if mac in data['macs']:
+                    client_id = i
+                    break
+            sig_display = str(signal) if signal is not None else "-"
+            print(f"{client_id if client_id is not None else '-':<5} {sig_display:<12} {mac:<20} {ssid:<30}")
+
+        # ------------------ Client Fingerprints ------------------
+        print("\n[!] Client Profiles (fingerprinted):")
+        print(f"{'ID':<5} {'MAC count':<10} {'Known SSIDs'}")
+        print("-" * 60)
+
+        for i, (fp, data) in enumerate(client_profiles.items()):
+            if data['ssids']: 
+                ssids = ', '.join(list(data['ssids']))
+                print(f"{i:<5} {len(data['macs']):<10} {ssids}")
+
+        # ------------------ Detected Probe Responses ------------------
         print("\n[!] Detected Probe Responses (APs responding):")
         print(f"{'AP MAC':<20} {'ESSID (responded to)':<30}")
         print("-" * 50)
+
         for mac, ssid in probe_responses_seen:
             print(f"{mac:<20} {ssid:<30}")
 
@@ -1010,14 +1058,14 @@ def karma_packet_handler(pkt):
     if pkt.haslayer(Dot11):
         dot11 = pkt.getlayer(Dot11)
 
-        # --- Probe Request (subtype 4) or Association Request (subtype 0) ---
-        if dot11.type == 0 and dot11.subtype in [0, 4]:
+        # --- Probe Request (subtype 4) ---
+        if dot11.type == 0 and dot11.subtype == 4:
             client_mac = dot11.addr2
             ssid = None
 
             elt = pkt.getlayer(Dot11Elt)
             while elt:
-                if elt.ID == 0:
+                if elt.ID == 0:  # SSID
                     try:
                         ssid = elt.info.decode(errors="ignore")
                     except:
@@ -1026,11 +1074,19 @@ def karma_packet_handler(pkt):
                 elt = elt.payload.getlayer(Dot11Elt)
 
             if ssid:
-                entry = (client_mac, ssid)
-                if entry not in seen_clients:
-                    with display_lock:
-                        seen_clients.add(entry)
-                    display_status()
+                key = (client_mac, ssid)
+                signal = getattr(pkt, 'dBm_AntSignal', None)
+                with display_lock:
+                    if key not in seen_clients or (signal is not None and signal > seen_clients[key]):
+                        seen_clients[key] = signal
+
+            fp = fingerprint_client(pkt)
+            if fp:
+                if fp not in client_profiles:
+                    client_profiles[fp] = {"ssids": set(), "macs": set()}
+                if ssid:
+                    client_profiles[fp]["ssids"].add(ssid)
+                client_profiles[fp]["macs"].add(client_mac)  # optionnel pour debug
 
         # --- Probe Response (subtype 5) ---
         elif dot11.type == 0 and dot11.subtype == 5:
@@ -1053,10 +1109,10 @@ def karma_packet_handler(pkt):
                     with display_lock:
                         probe_responses_seen.add(entry)
 
+
 # Thread Sniff
 def sniff_loop(INTERFACE):
     sniff(iface=INTERFACE, prn=karma_packet_handler, store=0, stop_filter=lambda x: stop_event.is_set())
-
 
 ########################## START KARMA AP ##########################
 def run(cmd):
