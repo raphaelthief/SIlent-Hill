@@ -69,16 +69,47 @@ conf.verb = 0
 IPINFO_TOKEN = None  # ipinfo.io token API if you want
 
 WEB_PORTS = [80, 443, 8080, 8443]
+
 OTHER_PORTS = {
     21: "FTP",
     22: "SSH",
     23: "Telnet",
-    3389: "RDP",
+
+    25: "SMTP",
+    53: "DNS",
+    67: "DHCP Server",
+    68: "DHCP Client",
+    110: "POP3",
+    111: "RPCbind",
+    135: "RPC (Windows)",
+    137: "NetBIOS Name Service",
+    138: "NetBIOS Datagram",
+    139: "NetBIOS Session",
+    143: "IMAP",
+    161: "SNMP",
+    389: "LDAP",
+
+    123: "NTP",
+
     445: "SMB",
+    587: "SMTP Submission",
+
+    636: "LDAPS",
+    2049: "NFS",
+
     3306: "MySQL",
+    3389: "RDP",
     5432: "PostgreSQL",
-    5900: "VNC"
+
+    5900: "VNC",
+
+    5985: "WinRM HTTP",
+    5986: "WinRM HTTPS",
+
+    631: "CUPS (Printing)",
+    1433: "Microsoft SQL Server"
 }
+
 PORTS = WEB_PORTS + list(OTHER_PORTS.keys())
 seen_ips = set()
 ip_info_cache = {}
@@ -199,6 +230,7 @@ def enable_ip_forwarding():
     os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
     os.system("iptables -t nat -D POSTROUTING -o {} -j MASQUERADE 2>/dev/null".format(iface_spy))
     os.system("iptables -t nat -A POSTROUTING -o {} -j MASQUERADE".format(iface_spy))
+
 
 def spoof():
     global victim_mac, gateway_mac
@@ -748,6 +780,11 @@ def icmp_scan(network, max_workers=25):
                 pass
     return alive_hosts
 
+def icmp_timestamp_ping(ip, timeout=1):
+    pkt = IP(dst=ip)/ICMP(type=13)
+    resp = sr1(pkt, timeout=timeout, verbose=0)
+    return resp is not None
+
 def tcp_syn_scan(ip, ports=[80, 443, 22], timeout=1):
     for port in ports:
         pkt = IP(dst=ip)/TCP(dport=port, flags='S')
@@ -798,6 +835,21 @@ def get_snmp_sysinfo(ip, community="public"):
         return output.decode().strip()
     except subprocess.CalledProcessError:
         return None
+
+def tcp_ack_ping(ip, ports=[80, 443], timeout=1):
+    for port in ports:
+        pkt = IP(dst=ip)/TCP(dport=port, flags='A')
+        resp = sr1(pkt, timeout=timeout, verbose=0)
+        if resp and resp.haslayer(TCP):
+            return True
+    return False
+
+def udp_ping(ip, port=53, timeout=2):
+    pkt = IP(dst=ip)/UDP(dport=port)
+    resp = sr1(pkt, timeout=timeout, verbose=0)
+    if resp:
+        return True
+    return False
 
 ########################## KILL CONNEXION MODE (--kill) ##########################
 def kill_connection():
@@ -1453,7 +1505,36 @@ def main():
                     })
 
         alive_icmp = icmp_scan(args.network)
-        for ip in alive_icmp:
+
+        all_ips = {str(ip) for ip in ipaddress.IPv4Network(args.network).hosts()}
+        discovered_ips = ips_arp.union(set(alive_icmp))
+        remaining_ips = all_ips - discovered_ips
+
+        def fallback_check(ip):
+            if icmp_timestamp_ping(ip):
+                return ip
+            if tcp_syn_scan(ip):
+                return ip
+            if tcp_ack_ping(ip):
+                return ip
+            if udp_ping(ip):
+                return ip
+            return None
+
+        print("[*] Fallback discovery (ICMP-Timestamp / TCP / UDP)...")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            results = list(tqdm(
+                executor.map(fallback_check, remaining_ips),
+                total=len(remaining_ips),
+                desc="Fallback",
+                unit="ip"
+            ))
+
+        extra_alive = [ip for ip in results if ip]
+
+        all_alive = list(set(alive_icmp + extra_alive))
+        for ip in tqdm(all_alive, desc="Enriching hosts", unit="host"):
             if ip not in ips_arp:
                 hostname = get_hostname(ip)
                 mac = None
