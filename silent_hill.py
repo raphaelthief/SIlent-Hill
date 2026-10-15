@@ -1,6 +1,9 @@
 import requests, sys, argparse, ipaddress, subprocess, threading, time, os, socket, re, logging, signal, json, shutil, netifaces, random, itertools, ipaddress
 import concurrent.futures
 from scapy.all import *
+from scapy.packet import Packet
+from scapy.layers.smb2 import SMB2_Header, SMB2_Tree_Connect_Request, SMB2_Query_Directory_Request, SMB2_Query_Directory_Response, FILE_ID_BOTH_DIR_INFORMATION, FILE_BOTH_DIR_INFORMATION, FILE_FULL_DIR_INFORMATION, SMB2_Create_Request, SMB2_Create_Response
+from scapy.layers.ntlm import NTLMSSP, NTLMv2_RESPONSE
 from scapy.all import ARP, Ether, srp, ICMP, IP, IPv6, sr1, conf, TCP, UDP, DNSQR, sniff, DNS, Dot11ProbeReq, get_if_addr, rdpcap, Raw #, FTP, SMTP, Telnet, POP, IMAP, IPv6
 from tqdm import tqdm
 from collections import defaultdict
@@ -13,7 +16,7 @@ C = Fore.CYAN
 B = Fore.BLUE
 G = Fore.GREEN
 Y = Fore.YELLOW
-M = Fore.MAGENTA
+MA = Fore.MAGENTA
 RESET = Style.RESET_ALL
 
 banner = rf'''{R}
@@ -82,7 +85,6 @@ OTHER_PORTS = {
     21: "FTP",
     22: "SSH",
     23: "Telnet",
-
     25: "SMTP",
     53: "DNS",
     67: "DHCP Server",
@@ -117,6 +119,13 @@ OTHER_PORTS = {
     631: "CUPS (Printing)",
     1433: "Microsoft SQL Server"
 }
+
+SSH_PORT = 22
+_ssh_seen_connections = set()
+_ssh_seen_banners = set()
+
+SMB2_CREATE_PENDING = {}
+NTLM_CHALLENGES = {}  # (src, dst, sport, dport) -> server_challenge (8 bytes hex)
 
 PORTS = WEB_PORTS + list(OTHER_PORTS.keys())
 seen_ips = set()
@@ -833,48 +842,161 @@ def handle_external_ip(ip): # [IP] packets --> External IP adresses : try to get
             print(f"{current_time()} - {G}[IP]{RESET} External IP detected: {ip}") # Info not found, just display the external IP
 
 
+TRACKED_CLEARTEXT_FLOWS = {}
+FTP_COMMAND = re.compile(
+    rb"^(USER|PASS|ACCT|CWD|CDUP|PWD|LIST|NLST|MLSD|MLST|"
+    rb"RETR|STOR|STOU|APPE|DELE|MKD|RMD|RNFR|RNTO|TYPE|"
+    rb"PASV|EPSV|PORT|EPRT|AUTH|FEAT|SYST|QUIT|NOOP|SIZE|"
+    rb"MDTM|REST|ABOR|OPTS|HELP|STAT|SITE)(?:[ \t\r\n]|$)",
+    re.I
+)
+
+FTP_RESPONSE = re.compile(rb"^[1-5][0-9]{2}[ -]")
+
+SMTP_COMMAND = re.compile(
+    rb"^(EHLO|HELO|MAIL FROM:|RCPT TO:|DATA|RSET|NOOP|"
+    rb"QUIT|VRFY|EXPN|STARTTLS|AUTH)(?:[ \t\r\n]|$)",
+    re.I
+)
+
+SMTP_RESPONSE = re.compile(rb"^[2-5][0-9]{2}[ -]")
+
+POP3_SIGNATURE = re.compile(
+    rb"^(USER|PASS|STAT|LIST|RETR|DELE|NOOP|RSET|TOP|UIDL|"
+    rb"APOP|CAPA|STLS|QUIT)(?:[ \t\r\n]|$)",
+    re.I
+)
+
+POP3_RESPONSE = re.compile(rb"^(?:\+OK|-ERR)(?:[ \t\r\n]|$)", re.I)
+
+IMAP_SIGNATURE = re.compile(
+    rb"^(?:\* |[A-Za-z0-9]+ )(?:OK|NO|BAD|BYE|CAPABILITY|"
+    rb"LOGIN|AUTHENTICATE|SELECT|EXAMINE|FETCH|STORE|SEARCH|"
+    rb"LIST|LSUB|STATUS|LOGOUT|STARTTLS|NAMESPACE)(?:[ \t\r\n]|$)",
+    re.I
+)
+
+HTTP_SIGNATURE = re.compile(
+    rb"^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT|TRACE)"
+    rb" [^\r\n]{1,4096} HTTP/1\.[01]\r?\n",
+    re.I
+)
+
+HTTP_RESPONSE = re.compile(rb"^HTTP/1\.[01] [1-5][0-9]{2}(?: |$)")
+
+IRC_SIGNATURE = re.compile(
+    rb"^(NICK|USER|JOIN|PART|PRIVMSG|NOTICE|PING|PONG|"
+    rb"PASS|QUIT|CAP|AUTHENTICATE|MODE|TOPIC)(?:[ \t]|$)",
+    re.I
+)
+
+SIP_SIGNATURE = re.compile(
+    rb"^(INVITE|REGISTER|OPTIONS|BYE|CANCEL|ACK|MESSAGE|"
+    rb"SUBSCRIBE|NOTIFY|REFER|INFO|UPDATE) sip:",
+    re.I
+)
+
+SIP_RESPONSE = re.compile(rb"^SIP/2\.0 [1-6][0-9]{2}(?: |$)")
+
+TELNET_COMMAND = re.compile(
+    rb"^(login:|username:|password:|[\w.-]+ login:)",
+    re.I
+)
+
+def detect_cleartext_protocol(payload):
+    if not payload:
+        return None
+
+    data = payload.lstrip(b"\r\n\x00 \t").encode("utf-8", errors="replace") if isinstance(payload, str) else payload.lstrip(b"\r\n\x00 \t")
+    signatures = (
+        ("HTTP", HTTP_SIGNATURE),
+        ("HTTP", HTTP_RESPONSE),
+        ("FTP", FTP_COMMAND),
+        ("FTP", FTP_RESPONSE),
+        ("SMTP", SMTP_COMMAND),
+        ("SMTP", SMTP_RESPONSE),
+        ("POP3", POP3_SIGNATURE),
+        ("POP3", POP3_RESPONSE),
+        ("IMAP", IMAP_SIGNATURE),
+        ("IRC", IRC_SIGNATURE),
+        ("SIP", SIP_SIGNATURE),
+        ("SIP", SIP_RESPONSE),
+        ("Telnet", TELNET_COMMAND)
+    )
+
+    for protocol, regex in signatures:
+        if regex.search(data):
+            return protocol
+    return None
+
+
 def process_cleartext_protocols(packet):
     try:
         if "ICMP" not in PACKET_FILTER:
             if packet.haslayer(ICMP):
                 icmp_type = packet[ICMP].type
                 icmp_code = packet[ICMP].code
-                print(f"{current_time()} - {M}[ICMP]{RESET} {packet[IP].src} → {Y}{packet[IP].dst}{RESET} | Type: {Y}{icmp_type}{RESET} Code: {Y}{icmp_code}{RESET}")
+                print(f"{current_time()} - {MA}[ICMP]{RESET} {packet[IP].src} → {Y}{packet[IP].dst}{RESET} | Type: {Y}{icmp_type}{RESET} Code: {Y}{icmp_code}{RESET}")
+                return
+        
+        if packet.haslayer(TCP) and "TCP" not in PACKET_FILTER:
+            tcp = packet[TCP]
+            sport, dport = tcp.sport, tcp.dport
+            if sport in (443, 8443, 9443) or dport in (443, 8443, 9443):
                 return
 
-        
-        if packet.haslayer(TCP):
-            if "TCP" not in PACKET_FILTER:
-                sport = packet[TCP].sport
-                dport = packet[TCP].dport
+            raw = packet.getlayer(Raw)
+            payload = bytes(raw.load) if raw else b""
+            clean_payload = payload.decode("utf-8", errors="replace").rstrip()
+            src_ip = packet[IP].src if IP in packet else packet[IPv6].src
+            dst_ip = packet[IP].dst if IP in packet else packet[IPv6].dst
+            endpoints = sorted([
+                (src_ip, sport),
+                (dst_ip, dport),
+            ])
 
-                raw = packet.getlayer(Raw)
-                payload = raw.load.decode("utf-8", errors="replace") if raw else ""
-                clean_payload = payload.rstrip()
-                tcp_protocols = {
-                    20: "FTP-data",
-                    21: "FTP",
-                    23: "Telnet",
-                    25: "SMTP",
-                    79: "Finger",
-                    110: "POP3",
-                    143: "IMAP",
-                    194: "IRC",
-                    #445: "SMB",
-                    513: "Rlogin",
-                    8080: "HTTP-Proxy",
-                    1755: "MMS",
-                    # X11 ports range 6000-6063
-                }
+            flow_key = tuple(endpoints)
+            tcp_protocols = {
+                20: "FTP-data",
+                21: "FTP",
+                23: "Telnet",
+                25: "SMTP",
+                79: "Finger",
+                110: "POP3",
+                143: "IMAP",
+                194: "IRC",
+                513: "Rlogin",
+                8080: "HTTP-Proxy",
+                1755: "MMS",
+            }
 
+            proto = None
+            detected_by_content = False
+            if flow_key in TRACKED_CLEARTEXT_FLOWS:
+                proto = TRACKED_CLEARTEXT_FLOWS[flow_key]
+                detected_by_content = True
+
+            else:
                 if 6000 <= sport <= 6063 or 6000 <= dport <= 6063:
                     proto = "X11"
                 else:
                     proto = tcp_protocols.get(sport) or tcp_protocols.get(dport)
 
-                if proto and payload:
-                    highlighted = highlight_keywords(clean_payload)
-                    print(f"{current_time()} - {M}[{proto}]{RESET} Payload: {Y}{highlighted}{RESET}")
+                if proto is None and payload:
+                    proto = detect_cleartext_protocol(payload)
+                    if proto:
+                        detected_by_content = True
+                        TRACKED_CLEARTEXT_FLOWS[flow_key] = proto
+
+            if proto and payload:
+                direction = (f"{src_ip}:{sport} → {Y}{dst_ip}:{dport}{RESET}")
+                highlighted = highlight_keywords(clean_payload)
+                label = f"{proto}?" if detected_by_content else proto
+                print(f"{current_time()} - {MA}[{label}]{RESET} {direction} | Payload: {Y}{highlighted}{RESET}", flush=True)
+
+            flags = int(tcp.flags)
+            if flags & 0x05:  # FIN or RST
+                TRACKED_CLEARTEXT_FLOWS.pop(flow_key, None)
 
         elif packet.haslayer(UDP):
             if "UDP" not in PACKET_FILTER:
@@ -883,7 +1005,6 @@ def process_cleartext_protocols(packet):
                 raw = packet.getlayer(Raw)
                 payload = raw.load.decode(errors='ignore') if raw else ""
                 clean_payload = payload.rstrip()
-
                 udp_protocols = {
                     7: "Echo",
                     13: "Daytime",
@@ -901,39 +1022,12 @@ def process_cleartext_protocols(packet):
                 }
 
                 proto = udp_protocols.get(sport) or udp_protocols.get(dport)
-
                 if proto and payload:
                     highlighted = highlight_keywords(clean_payload)
-                    print(f"{current_time()} - {M}[{proto}]{RESET} Payload: {Y}{highlighted}{RESET}")
+                    print(f"{current_time()} - {MA}[{proto}]{RESET} Payload: {Y}{highlighted}{RESET}")
+
     except Exception:
         pass
-
-
-
-
-
-
-from scapy.packet import Packet
-
-from scapy.layers.smb2 import (
-    SMB2_Header,
-    SMB2_Tree_Connect_Request,
-    SMB2_Query_Directory_Request,
-    SMB2_Query_Directory_Response,
-    FILE_ID_BOTH_DIR_INFORMATION,
-    FILE_BOTH_DIR_INFORMATION,
-    FILE_FULL_DIR_INFORMATION,
-    SMB2_Create_Request,
-    SMB2_Create_Response,
-)
-
-from scapy.all import *
-from scapy.layers.ntlm import NTLMSSP, NTLMv2_RESPONSE
-import re
-
-
-SMB2_CREATE_PENDING = {}
-NTLM_CHALLENGES = {}  # (src, dst, sport, dport) -> server_challenge (8 bytes hex)
 
 
 def smb_decode_text(value):
@@ -1053,7 +1147,7 @@ def process_smb2_packet(packet):
             key = (dst, src, mid)
             filename = SMB2_CREATE_PENDING.pop(key, None)
             if filename:
-                print(f"{current_time()} - {M}[SMB2 CREATE RESPONSE]{RESET} {src} → {Y}{dst}{RESET} | File: {Y}{filename}{RESET}")
+                print(f"{current_time()} - {MA}[SMB2 CREATE RESPONSE]{RESET} {src} → {Y}{dst}{RESET} | File: {Y}{filename}{RESET}")
 
     except Exception as e:
         print(f"[WARN-SMB2] {type(e).__name__}: {e}")
@@ -1669,6 +1763,50 @@ def reset_smb2_detector():
     _smb2_monitor = SMB2Monitor(verbose=False)
 
 
+def process_SSH_packet(packet):
+    if TCP not in packet:
+        return
+
+    tcp = packet[TCP]
+    if tcp.sport != SSH_PORT and tcp.dport != SSH_PORT:
+        return
+
+    if IP in packet:
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+    elif IPv6 in packet:
+        src_ip = packet[IPv6].src
+        dst_ip = packet[IPv6].dst
+    else:
+        return
+
+    src = (src_ip, tcp.sport)
+    dst = (dst_ip, tcp.dport)
+    connection = tuple(sorted((src, dst)))
+    if connection not in _ssh_seen_connections:
+        _ssh_seen_connections.add(connection)
+        print(f"[{time.strftime('%H:%M:%S')}] - {MA}[SSH CONNECTION]{RESET} {src_ip}:{tcp.sport} -> {Y}{dst_ip}:{tcp.dport}{RESET}", flush=True)
+
+    if Raw not in packet:
+        return
+
+    payload = bytes(packet[Raw].load)
+    for line in payload.splitlines():
+        line = line.strip(b"\r\n")
+        if not line.startswith(b"SSH-"):
+            continue
+
+        banner = line.decode("ascii", errors="replace")
+        banner_key = (connection, src, banner)
+        if banner_key in _ssh_seen_banners:
+            continue
+
+        _ssh_seen_banners.add(banner_key)
+        print(f"[{time.strftime('%H:%M:%S')}] - {MA}[SSH BANNER]{RESET} {src_ip}:{tcp.sport} -> {Y}{dst_ip}:{tcp.dport}{RESET} | {banner}", flush=True)
+
+
+
+
 def sniff_traffic(): # Sniff source & destinations packets from the target
     print("[*] Sniffing DNS, HTTP, and TLS traffic...")
 
@@ -1720,6 +1858,13 @@ def sniff_traffic(): # Sniff source & destinations packets from the target
                         detect_smb2_find_response(packet)
             except Exception as e:
                 print(f"[WARN-SMB] {type(e).__name__}: {e}")
+
+            # SSH
+            try:
+                if "SSH" not in PACKET_FILTER:
+                    process_SSH_packet(packet)
+            except Exception as e:
+                print(f"[WARN-SSH] {type(e).__name__}: {e}")
 
             # SSDP
             try:
@@ -2816,11 +2961,11 @@ def print_devices(devices):
 
         browser_roles = d.get("browser_roles") or []
         if browser_roles:
-            print(f"   {Y}Browser     {RESET}: {M}{', '.join(map(str, browser_roles))}{RESET}")
+            print(f"   {Y}Browser     {RESET}: {MA}{', '.join(map(str, browser_roles))}{RESET}")
 
         browser_name = d.get("browser_name")
         if browser_name:
-            print(f"   {Y}NetBIOS     {RESET}: {M}{browser_name}{RESET}")
+            print(f"   {Y}NetBIOS     {RESET}: {MA}{browser_name}{RESET}")
 
         sysdescr = d.get("snmp_sysdescr")
         if sysdescr:
@@ -3223,7 +3368,7 @@ def main():
     parser.add_argument("--connect", "-c", help="Test access to the --network IP range", action='store_true')
     parser.add_argument("--listen", "-l", help="Passive listening of communications to discover network devices on --interface", action='store_true')
     parser.add_argument("--spy", "-s", help="Passive MITM with communication analysis (--target, --router, and --interface required)", action='store_true')
-    parser.add_argument("--exclude", "-e", help="Exclude packet analyzers from spy functions (comma-separated: HTTP,DNS,SMB,SSDP,TLS,ICMP,TCP,UDP,IP)", type=str)
+    parser.add_argument("--exclude", "-e", help="Exclude packet analyzers from spy functions (comma-separated: HTTP,DNS,SMB,SSH,SSDP,TLS,ICMP,TCP,UDP,IP). TCP = Cleartext protocols (also contains UDP)", type=str)
     parser.add_argument("-es", help="Exclude smb folders content (enum only shares on SMB packets)", action='store_true')
     parser.add_argument("--highlight", "-hi", help="Keywords to highlight during --spy observation (ex : --highlight tinder,badoo,grindr,pornhub or : --highlight sentinelone,crowdstrike,company)", type=str)
     parser.add_argument("--kill", "-k", help="Kill ARP connexion from target (--target, --router, and --interface required)", action='store_true')
