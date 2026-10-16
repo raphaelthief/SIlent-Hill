@@ -46,6 +46,7 @@ Debug_display = f'''
     sudo python silent_hill.py -s -i wlan0 -r 192.168.1.1 -t 192.168.1.93
     sudo python silent_hill.py -s -i wlan0 -r 192.168.1.24 -r 192.168.1.55 -r 192.168.1.87 -t 192.168.1.93
     sudo python silent_hill.py -k -r 192.168.1.1 -i wlan0 -t 192.168.1.46
+    sudo python silent_hill.py -k -r 192.168.1.254 -i wlan0 -t 192.168.1.46 -t 192.168.1.24
     sudo python silent_hill.py --karma-scan --karma-interface wlan0
     sudo python silent_hill.py --karma free_wifi --karma-interface wlan0 --karma-interface-internet wlan1 --karma-listen
     sudo python silent_hill.py --kill-karma
