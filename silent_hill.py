@@ -81,6 +81,8 @@ summary = ""
 PACKET_FILTER = set()
 EXCLUDE_SMB_FOLDERS = False
 
+query_show = True
+
 WEB_PORTS = [80, 443, 8080, 8443]
 
 OTHER_PORTS = {
@@ -195,6 +197,10 @@ def signal_handler3(sig, frame):  # Ctrl+C handler
     print(f"\n[*] {R}Ctrl + C detected. Stopping threads...{RESET}")
     stop_event.set()  # Kill all threads
     restore_interface(start_iface, "karma_off")
+    sys.exit(0)
+
+def signal_handler4(sig, frame): # Ctrl+C cleint discovery & scanning stuff
+    print(f"\n[*] {R}Ctrl + C detected. Closing ...{RESET}")
     sys.exit(0)
 
 def load_oui(file_path): # Manufacturer (from MAC adress) file oui.txt
@@ -2364,10 +2370,11 @@ def packet_handler(pkt):
             }
             info = seen_hosts[ip]
             print(f"{G}[+] {Y}{ip:15}{RESET} | Hostname: {info['hostname']:25} | MAC: {info['mac']:20} | OUI: {info['oui']:30} | Proto: {info['proto']:5} | Ports: {info['ports']}") # Screen display during the search
-        
-            if info["dns_queries"]:
-                print(f"--> DNS queries: {', '.join(sorted(info['dns_queries']))}")
             
+            if query_show == True:
+                if info["dns_queries"]:
+                    print(f"--> DNS queries: {', '.join(sorted(info['dns_queries']))}")
+                
             return
 
         info = seen_hosts[ip]
@@ -2391,11 +2398,11 @@ def packet_handler(pkt):
         if ports and info["ports"] == "?":
             info["ports"] = ports
             updated = True
-
-        for query in dns_queries:
-            if query not in info["dns_queries"]:
-                info["dns_queries"].add(query)
-                updated = True
+        if query_show == True:
+            for query in dns_queries:
+                if query not in info["dns_queries"]:
+                    info["dns_queries"].add(query)
+                    updated = True
 
         if browser_name and info.get("browser_name") != browser_name:
             info["browser_name"] = browser_name
@@ -2423,8 +2430,9 @@ def packet_handler(pkt):
                 device_type_text = ", ".join(sorted(info.get("device_type") or set())) or "?"
                 print(f"--> Device: {C}{info.get('browser_name', '?')}{RESET} Type: {C}{device_type_text}{RESET} Server Type: {C}{info.get('server_type', '?')}{RESET} OS: {C}{info.get('os_version', '?')}{RESET}")
 
-            if info["dns_queries"]:
-                print(f"--> DNS queries: {C}{', '.join(sorted(info['dns_queries']))}{RESET}")
+            if query_show == True:
+                if info["dns_queries"]:
+                    print(f"--> DNS queries: {C}{', '.join(sorted(info['dns_queries']))}{RESET}")
 
     except Exception as e:
         print(f"{R}[PACKET ERROR]{RESET} {type(e).__name__}: {e}")
@@ -2439,8 +2447,9 @@ def print_summary():
                 device_type_text = ", ".join(sorted(info.get("device_type") or set())) or "?"
                 print(f"--> Device: {C}{info.get('browser_name', '?')}{RESET} Type: {C}{device_type_text}{RESET} Server Type: {C}{info.get('server_type', '?')}{RESET} OS: {C}{info.get('os_version', '?')}{RESET}")
             
-            if info["dns_queries"]:
-                print(f"--> DNS queries: {C}{', '.join(sorted(info['dns_queries']))}{RESET}")
+            if query_show == True:
+                if info["dns_queries"]:
+                    print(f"--> DNS queries: {C}{', '.join(sorted(info['dns_queries']))}{RESET}")
         time.sleep(10)
 
 
@@ -3409,13 +3418,14 @@ def cleanup(signal_received=None, frame=None):
 
 ########################## MAIN ##########################
 def main():
-    global victim_ips, gateway_ips, iface_spy, start_iface, karma_interface, INTERNET_INTERFACE, ESSID_fakeAP, highlight_keywords_list, current_channel, summary, MY_IP, PACKET_FILTER, EXCLUDE_SMB_FOLDERS
+    global victim_ips, gateway_ips, iface_spy, start_iface, karma_interface, INTERNET_INTERFACE, ESSID_fakeAP, highlight_keywords_list, current_channel, summary, MY_IP, PACKET_FILTER, EXCLUDE_SMB_FOLDERS, query_show
     print(banner)
     parser = argparse.ArgumentParser(description="Silence reveals what noise conceals")
     parser.add_argument("--network", "-n", help="IP range to scan (e.g., 192.168.1.0/24)")
     parser.add_argument("--discovery", "-d", help="Identify devices connected to the --network IP range", action='store_true')
     parser.add_argument("--connect", "-c", help="Test access to the --network IP range", action='store_true')
     parser.add_argument("--listen", "-l", help="Passive listening of communications to discover network devices on --interface", action='store_true')
+    parser.add_argument("--dns-query-off", "--dqo", help="Do not show DNS query with the --listen mode", action='store_true')
     parser.add_argument("--spy", "-s", help="Passive MITM with communication analysis (--target, --router, and --interface required)", action='store_true')
     parser.add_argument("--exclude", "-e", help="Exclude packet analyzers from spy functions (comma-separated: HTTP,DNS,SMB,SSH,SSDP,TLS,ICMP,TCP,UDP,IP). TCP = Cleartext protocols (also contains UDP)", type=str)
     parser.add_argument("-es", help="Exclude smb folders content (enum only shares on SMB packets)", action='store_true')
@@ -3453,6 +3463,9 @@ def main():
 
     if args.highlight:
         highlight_keywords_list = [w.strip().lower() for w in args.highlight.split(",")]
+
+    if args.dns_query_off:
+        query_show = False
 
     if args.karma:
         if not args.karma_interface:
@@ -3557,7 +3570,7 @@ def main():
             print(f"[!] {R}No --interface defined ...{RESET}")
             sys.exit(0)
         else:
-            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGINT, signal_handler4)
             if not oui_map:
                 print("[!] OUI database empty or not found")
 
@@ -3568,7 +3581,7 @@ def main():
             sniff(prn=packet_handler, store=False, iface=args.interface)
 
     if args.connect:
-        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler4)
         print(f"[*] {Y}Scanning in progress on {args.network} ...{RESET}")
         start_time = time.time()
         threads = []
@@ -3592,7 +3605,7 @@ def main():
         print(f"\n{Y}Total time: {RESET}{duration:.1f}s")
 
     if args.discovery:
-        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGINT, signal_handler4)
         print("[*] Loading OUI database from oui.txt")
         if not oui_map:
             print(f"[!] {R}OUI database empty or not found{RESET}")
